@@ -98,6 +98,43 @@ def request_accessibility_permission():
                         'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'])
 
 
+# --- Input Monitoring (required for CGEventTap to receive HID events) ---
+_iokit = ctypes.cdll.LoadLibrary(
+    '/System/Library/Frameworks/IOKit.framework/IOKit'
+)
+try:
+    _iokit.IOHIDCheckAccess.restype = ctypes.c_uint32
+    _iokit.IOHIDCheckAccess.argtypes = [ctypes.c_uint32]
+    _iokit.IOHIDRequestAccess.restype = ctypes.c_bool
+    _iokit.IOHIDRequestAccess.argtypes = [ctypes.c_uint32]
+    _HAS_HID_ACCESS_API = True
+except AttributeError:
+    _HAS_HID_ACCESS_API = False
+
+# kIOHIDRequestTypeListenEvent = 1, kIOHIDAccessTypeGranted = 0
+_KIO_LISTEN = 1
+
+
+def has_input_monitoring_permission() -> bool:
+    if not _HAS_HID_ACCESS_API:
+        return True  # pre-10.15: no separate permission existed
+    try:
+        return _iokit.IOHIDCheckAccess(_KIO_LISTEN) == 0
+    except Exception:
+        return True
+
+
+def request_input_monitoring_permission():
+    if _HAS_HID_ACCESS_API:
+        try:
+            _iokit.IOHIDRequestAccess(_KIO_LISTEN)
+            return
+        except Exception:
+            pass
+    subprocess.run(['open',
+                    'x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent'])
+
+
 # --- User-input tracking via CGEventTap filtered by PID ---
 import os
 _OUR_PID = os.getpid()
@@ -146,23 +183,34 @@ def _tap_callback(proxy, event_type, event, refcon):
 _tap_callback_c = _TAP_CALLBACK_TYPE(_tap_callback)
 
 
+_tap_alive = False
+
+
+def is_event_tap_alive() -> bool:
+    return _tap_alive
+
+
 def _start_event_tap():
-    if not has_accessibility_permission():
-        return
+    global _tap_alive
     # Mask: keyDown(10), keyUp(11), mouseMoved(5), leftMouseDown(1), leftMouseUp(2),
     #       rightMouseDown(3), rightMouseDragged(6), leftMouseDragged(7), scrollWheel(22)
     mask = ((1 << 10) | (1 << 11) | (1 << 5) | (1 << 1) | (1 << 2) |
             (1 << 3) | (1 << 6) | (1 << 7) | (1 << 22))
-    # kCGHIDEventTap=0, kCGHeadInsertEventTap=0, kCGEventTapOptionListenOnly=1
-    tap = _cg.CGEventTapCreate(0, 0, 1, mask, _tap_callback_c, None)
-    if not tap:
-        return
-    source = _cf.CFMachPortCreateRunLoopSource(None, tap, 0)
-    if not source:
-        return
-    _cf.CFRunLoopAddSource(_cf.CFRunLoopGetCurrent(), source, _kCFRunLoopCommonModes)
-    _cg.CGEventTapEnable(tap, True)
-    _cf.CFRunLoopRun()
+    while True:
+        if (has_accessibility_permission() and
+                has_input_monitoring_permission() and
+                not _tap_alive):
+            # kCGHIDEventTap=0, kCGHeadInsertEventTap=0, kCGEventTapOptionListenOnly=1
+            tap = _cg.CGEventTapCreate(0, 0, 1, mask, _tap_callback_c, None)
+            if tap:
+                source = _cf.CFMachPortCreateRunLoopSource(None, tap, 0)
+                if source:
+                    _cf.CFRunLoopAddSource(_cf.CFRunLoopGetCurrent(), source, _kCFRunLoopCommonModes)
+                    _cg.CGEventTapEnable(tap, True)
+                    _tap_alive = True
+                    _cf.CFRunLoopRun()  # blocks while tap is live
+                    _tap_alive = False
+        time.sleep(2)
 
 
 threading.Thread(target=_start_event_tap, daemon=True).start()
@@ -215,32 +263,59 @@ class YesManClaudeApp(tk.Tk):
         self._running = False
         self._thread = None
         self._banner = None
+        self._banner_state = None
         self._build_ui()
         if not has_accessibility_permission():
             self.after(500, request_accessibility_permission)
-        self._poll_accessibility()
+        if not has_input_monitoring_permission():
+            self.after(1500, request_input_monitoring_permission)
+        self._poll_permissions()
 
-    def _poll_accessibility(self):
-        granted = has_accessibility_permission()
-        if granted and self._banner is not None:
-            self._banner.destroy()
-            self._banner = None
-        elif not granted and self._banner is None:
-            self._show_banner()
-        self.after(1000, self._poll_accessibility)
+    def _missing_permissions(self):
+        missing = []
+        if not has_accessibility_permission():
+            missing.append('accessibility')
+        if not has_input_monitoring_permission():
+            missing.append('input_monitoring')
+        return missing
 
-    def _show_banner(self):
+    def _poll_permissions(self):
+        missing = self._missing_permissions()
+        if missing != self._banner_state:
+            if self._banner is not None:
+                self._banner.destroy()
+                self._banner = None
+            if missing:
+                self._show_banner(missing)
+            self._banner_state = missing
+        self.after(1000, self._poll_permissions)
+
+    def _show_banner(self, missing):
         self._banner = tk.Frame(self._frame, bg='#fff3cd', pady=8, padx=10)
         self._banner.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(0, 10))
+
+        if 'accessibility' in missing and 'input_monitoring' in missing:
+            msg = 'Missing Accessibility & Input Monitoring permissions.'
+        elif 'accessibility' in missing:
+            msg = 'Accessibility permission missing — keystrokes will not be sent.'
+        else:
+            msg = 'Input Monitoring permission missing — user activity not detected.'
+
         tk.Label(
-            self._banner,
-            text='Accessibility permission missing — keystrokes will not be sent.',
-            bg='#fff3cd', fg='#856404', wraplength=280, justify='left'
+            self._banner, text=msg,
+            bg='#fff3cd', fg='#856404', wraplength=200, justify='left'
         ).pack(side='left', fill='x', expand=True)
-        ttk.Button(
-            self._banner, text='Grant Access',
-            command=request_accessibility_permission
-        ).pack(side='right', padx=(8, 0))
+
+        btns = tk.Frame(self._banner, bg='#fff3cd')
+        btns.pack(side='right')
+        if 'accessibility' in missing:
+            ttk.Button(btns, text='Grant Accessibility',
+                       command=request_accessibility_permission
+                       ).pack(fill='x')
+        if 'input_monitoring' in missing:
+            ttk.Button(btns, text='Grant Input Monitoring',
+                       command=request_input_monitoring_permission
+                       ).pack(fill='x', pady=(2, 0))
 
     def _build_ui(self):
         pad = {'padx': 12, 'pady': 6}
@@ -248,8 +323,10 @@ class YesManClaudeApp(tk.Tk):
         self._frame.grid(row=0, column=0, sticky='nsew')
         frame = self._frame
 
-        if not has_accessibility_permission():
-            self._show_banner()
+        missing = self._missing_permissions()
+        if missing:
+            self._show_banner(missing)
+            self._banner_state = missing
 
         r = 1
         ttk.Label(frame, text='Shortcut 1:').grid(row=r, column=0, sticky='w', **pad)
