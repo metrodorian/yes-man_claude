@@ -19,8 +19,8 @@ _cg.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
 _cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
 _cf.CFRelease.argtypes = [ctypes.c_void_p]
 
-# kCGEventSourceStatePrivate = -1 → synthetic events won't reset HIDIdleTime
-_EVENT_SOURCE = _cg.CGEventSourceCreate(-1)
+# kCGEventSourceStateHIDSystemState = 0 → synthetic events won't reset HIDIdleTime
+_EVENT_SOURCE = _cg.CGEventSourceCreate(0)
 
 KEY_CODES = {
     'a': 0, 's': 1, 'd': 2, 'f': 3, 'h': 4, 'g': 5, 'z': 6, 'x': 7,
@@ -97,23 +97,79 @@ def request_accessibility_permission():
                         'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'])
 
 
-# --- Background system-state poller ---
+# --- Mouse position polling (CGGetLastMouseDelta is deprecated/broken) ---
+class _CGPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+_cg.CGEventCreate.restype = ctypes.c_void_p
+_cg.CGEventCreate.argtypes = [ctypes.c_void_p]
+_cg.CGEventGetLocation.restype = _CGPoint
+_cg.CGEventGetLocation.argtypes = [ctypes.c_void_p]
+
+
+def _mouse_position():
+    e = _cg.CGEventCreate(None)
+    p = _cg.CGEventGetLocation(e)
+    _cf.CFRelease(e)
+    return (p.x, p.y)
+
+
+# --- Background poller (frontmost app + ioreg idle for keyboard detection) ---
 _cache_lock = threading.Lock()
-_cached_idle: float = 0.0
 _cached_app: str = ''
+_cached_ioreg_idle: float = 0.0
+# Shared last-user-activity timestamp, updated by poller and mouse checker
+_last_user_activity: float = time.monotonic()
+_last_sent: float = 0.0
+
+
+def _set_last_sent(t: float):
+    global _last_sent
+    _last_sent = t
+
+
+def get_user_idle_seconds() -> float:
+    return time.monotonic() - _last_user_activity
+
+
+def get_frontmost_app() -> str:
+    with _cache_lock:
+        return _cached_app
+
+
+def _poll_mouse():
+    """High-frequency mouse-movement detection — our keystrokes don't move the mouse."""
+    global _last_user_activity
+    last_pos = _mouse_position()
+    while True:
+        pos = _mouse_position()
+        if pos != last_pos:
+            _last_user_activity = time.monotonic()
+            last_pos = pos
+        time.sleep(0.05)
 
 
 def _poll_system_state():
-    global _cached_idle, _cached_app
+    """Low-frequency: frontmost app + ioreg idle for keyboard-activity detection."""
+    global _cached_app, _cached_ioreg_idle, _last_user_activity
+    prev_ioreg = 0.0
     while True:
         try:
             out = subprocess.check_output(
                 ['ioreg', '-c', 'IOHIDSystem'], stderr=subprocess.DEVNULL, timeout=2
             ).decode()
             m = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', out)
-            idle = int(m.group(1)) / 1e9 if m else 0.0
+            ioreg = int(m.group(1)) / 1e9 if m else 0.0
         except Exception:
-            idle = 0.0
+            ioreg = prev_ioreg
+
+        # ioreg idle reset = keyboard or click activity
+        if ioreg < prev_ioreg - 0.3:
+            # Only count as user activity if outside our grace window
+            if time.monotonic() - _last_sent > 1.5:
+                _last_user_activity = time.monotonic()
+        prev_ioreg = ioreg
 
         try:
             app = subprocess.check_output(
@@ -125,23 +181,14 @@ def _poll_system_state():
             app = ''
 
         with _cache_lock:
-            _cached_idle = idle
             _cached_app = app
+            _cached_ioreg_idle = ioreg
 
         time.sleep(0.5)
 
 
+threading.Thread(target=_poll_mouse, daemon=True).start()
 threading.Thread(target=_poll_system_state, daemon=True).start()
-
-
-def get_system_idle_seconds() -> float:
-    with _cache_lock:
-        return _cached_idle
-
-
-def get_frontmost_app() -> str:
-    with _cache_lock:
-        return _cached_app
 
 
 # --- App ---
@@ -268,7 +315,7 @@ class YesManClaudeApp(tk.Tk):
                 time.sleep(0.1)
                 continue
 
-            idle = get_system_idle_seconds()
+            idle = get_user_idle_seconds()
 
             if idle >= idle_threshold:
                 frontmost = get_frontmost_app()
@@ -279,6 +326,7 @@ class YesManClaudeApp(tk.Tk):
                     continue
                 press_shortcut(*sc1)
                 press_shortcut(*sc2)
+                _set_last_sent(time.monotonic())
                 self._count += 1
                 self.after(0, self._counter_var.set, f'Sent: {self._count}')
                 self.after(0, self._status_var.set, f'Running — sent #{self._count}')

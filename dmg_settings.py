@@ -1,10 +1,10 @@
 import os
 
-application = "Yes Man Claude.app"
+application = "Yes Man.app"
 appname = os.path.basename(application)
 
 format = "UDZO"
-size = "60M"
+size = "10M"
 
 files = [application]
 symlinks = {"Applications": "/Applications"}
