@@ -5,8 +5,7 @@ import threading
 import time
 import ctypes
 import subprocess
-from pynput import keyboard as kb_module
-from pynput import mouse as mouse_module
+import re
 from pynput.keyboard import Key, Controller
 
 keyboard = Controller()
@@ -14,6 +13,32 @@ keyboard = Controller()
 _appservices = ctypes.cdll.LoadLibrary(
     "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
 )
+
+
+def get_frontmost_app() -> str:
+    try:
+        return subprocess.check_output(
+            ["osascript", "-e",
+             'tell application "System Events" to get name of first process whose frontmost is true'],
+            stderr=subprocess.DEVNULL, timeout=1
+        ).decode().strip()
+    except Exception:
+        return ""
+
+
+def get_system_idle_seconds() -> float:
+    """Read HIDIdleTime via ioreg — no Accessibility permission needed."""
+    try:
+        out = subprocess.check_output(
+            ["ioreg", "-c", "IOHIDSystem"],
+            stderr=subprocess.DEVNULL, timeout=1
+        ).decode()
+        m = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', out)
+        if m:
+            return int(m.group(1)) / 1e9
+    except Exception:
+        pass
+    return 0.0
 
 
 def has_accessibility_permission() -> bool:
@@ -89,13 +114,13 @@ class KeyRepeaterApp(tk.Tk):
         self.resizable(False, False)
         self._running = False
         self._thread = None
-        self._last_activity = 0.0
-        self._kb_listener = None
-        self._mouse_listener = None
         self._build_ui()
+        # Ask for accessibility on startup if missing
+        if not has_accessibility_permission():
+            self.after(500, self._prompt_accessibility)
 
-    def _on_activity(self, *_):
-        self._last_activity = time.monotonic()
+    def _prompt_accessibility(self):
+        request_accessibility_permission()
 
     def _build_ui(self):
         pad = {"padx": 12, "pady": 6}
@@ -135,7 +160,11 @@ class KeyRepeaterApp(tk.Tk):
             textvariable=self._interval_var, width=8, format="%.1f"
         ).grid(row=r+2, column=1, sticky="w", **pad)
 
-        ttk.Label(frame, text="Pause after activity (s):").grid(row=r+3, column=0, sticky="w", **pad)
+        ttk.Label(frame, text="Only when app focused:").grid(row=r+3, column=0, sticky="w", **pad)
+        self._app_var = tk.StringVar(value="Claude")
+        ttk.Entry(frame, textvariable=self._app_var, width=22).grid(row=r+3, column=1, sticky="ew", **pad)
+
+        ttk.Label(frame, text="Pause after activity (s):").grid(row=r+4, column=0, sticky="w", **pad)
         self._idle_var = tk.DoubleVar(value=5.0)
         ttk.Spinbox(
             frame, from_=1.0, to=60.0, increment=0.5,
@@ -144,15 +173,15 @@ class KeyRepeaterApp(tk.Tk):
 
         self._status_var = tk.StringVar(value="Stopped")
         ttk.Label(frame, textvariable=self._status_var, foreground="gray").grid(
-            row=r+4, column=0, columnspan=2, pady=(4, 8)
+            row=r+5, column=0, columnspan=2, pady=(4, 8)
         )
 
         self._toggle_btn = ttk.Button(frame, text="▶  Start", command=self._toggle, width=18)
-        self._toggle_btn.grid(row=r+5, column=0, columnspan=2, pady=(0, 4))
+        self._toggle_btn.grid(row=r+6, column=0, columnspan=2, pady=(0, 4))
 
         self._counter_var = tk.StringVar(value="Sent: 0")
         ttk.Label(frame, textvariable=self._counter_var, foreground="gray").grid(
-            row=r+6, column=0, columnspan=2
+            row=r+7, column=0, columnspan=2
         )
         self._count = 0
 
@@ -183,53 +212,32 @@ class KeyRepeaterApp(tk.Tk):
             self._status_var.set("Invalid input")
             return
 
+        target_app = self._app_var.get().strip()
         self._running = True
         self._count = 0
-        # Start fresh — treat app start as activity so we wait idle_threshold first
-        self._last_activity = time.monotonic()
-
         self._toggle_btn.config(text="■  Stop")
         self._status_var.set(f"Running — waiting for {idle_threshold:.0f}s idle")
 
-        # Global listeners for keyboard and mouse activity
-        try:
-            self._kb_listener = kb_module.Listener(on_press=self._on_activity)
-            self._kb_listener.start()
-        except Exception as e:
-            print(f"keyboard listener error: {e}", flush=True)
-            self._kb_listener = None
-
-        try:
-            self._mouse_listener = mouse_module.Listener(
-                on_move=self._on_activity,
-                on_click=self._on_activity,
-                on_scroll=self._on_activity,
-            )
-            self._mouse_listener.start()
-        except Exception as e:
-            print(f"mouse listener error: {e}", flush=True)
-            self._mouse_listener = None
-
         self._thread = threading.Thread(
-            target=self._loop, args=(sc1, sc2, interval, idle_threshold), daemon=True
+            target=self._loop, args=(sc1, sc2, interval, idle_threshold, target_app), daemon=True
         )
         self._thread.start()
 
     def _stop(self):
         self._running = False
-        if self._kb_listener:
-            self._kb_listener.stop()
-            self._kb_listener = None
-        if self._mouse_listener:
-            self._mouse_listener.stop()
-            self._mouse_listener = None
         self._toggle_btn.config(text="▶  Start")
         self._status_var.set("Stopped")
 
-    def _loop(self, sc1, sc2, interval, idle_threshold):
+    def _loop(self, sc1, sc2, interval, idle_threshold, target_app):
         while self._running:
-            idle = time.monotonic() - self._last_activity
+            idle = get_system_idle_seconds()
             if idle >= idle_threshold:
+                frontmost = get_frontmost_app()
+                if target_app and target_app.lower() not in frontmost.lower():
+                    self.after(0, self._status_var.set,
+                               f"Waiting — {frontmost or '?'} in focus")
+                    time.sleep(0.5)
+                    continue
                 press_shortcut(*sc1)
                 press_shortcut(*sc2)
                 self._count += 1
