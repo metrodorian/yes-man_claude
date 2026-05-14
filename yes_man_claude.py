@@ -6,6 +6,8 @@ import time
 import ctypes
 import subprocess
 import re
+import os
+import sys
 
 # --- CoreGraphics key sending (private event source = won't affect HIDIdleTime) ---
 _cg = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
@@ -136,7 +138,6 @@ def request_input_monitoring_permission():
 
 
 # --- User-input tracking via CGEventTap filtered by PID ---
-import os
 _OUR_PID = os.getpid()
 _last_user_activity: float = time.monotonic()
 
@@ -254,6 +255,21 @@ def _set_last_sent(_t: float):
     pass
 
 
+def _bundle_app_path():
+    """Return the .app bundle path, or None when running outside a bundle."""
+    res = os.environ.get('RESOURCEPATH')
+    if res:
+        candidate = os.path.normpath(os.path.join(res, '..', '..'))
+        if candidate.endswith('.app'):
+            return candidate
+    p = os.path.abspath(__file__)
+    while p and p != '/':
+        if p.endswith('.app'):
+            return p
+        p = os.path.dirname(p)
+    return None
+
+
 # --- App ---
 class YesManClaudeApp(tk.Tk):
     def __init__(self):
@@ -295,11 +311,15 @@ class YesManClaudeApp(tk.Tk):
         self._banner.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(0, 10))
 
         if 'accessibility' in missing and 'input_monitoring' in missing:
-            msg = 'Missing Accessibility & Input Monitoring permissions.'
+            msg = ('Grant Accessibility & Input Monitoring, then click '
+                   'Restart so macOS recognises the new permissions.')
         elif 'accessibility' in missing:
-            msg = 'Accessibility permission missing — keystrokes will not be sent.'
+            msg = ('Accessibility permission missing — grant it, then click '
+                   'Restart. Keystrokes will not be sent otherwise.')
         else:
-            msg = 'Input Monitoring permission missing — user activity not detected.'
+            msg = ('Input Monitoring permission missing — grant it, then '
+                   'click Restart. User activity will not be detected '
+                   'otherwise.')
 
         tk.Label(
             self._banner, text=msg,
@@ -316,6 +336,16 @@ class YesManClaudeApp(tk.Tk):
             ttk.Button(btns, text='Grant Input Monitoring',
                        command=request_input_monitoring_permission
                        ).pack(fill='x', pady=(2, 0))
+        ttk.Button(btns, text='Restart',
+                   command=self._restart_app
+                   ).pack(fill='x', pady=(6, 0))
+
+    def _restart_app(self):
+        app_path = _bundle_app_path()
+        if app_path:
+            subprocess.Popen(['open', '-n', app_path])
+        self.destroy()
+        sys.exit(0)
 
     def _build_ui(self):
         pad = {'padx': 12, 'pady': 6}
