@@ -169,7 +169,7 @@ class KeyRepeaterApp(tk.Tk):
         ttk.Spinbox(
             frame, from_=1.0, to=60.0, increment=0.5,
             textvariable=self._idle_var, width=8, format="%.1f"
-        ).grid(row=r+3, column=1, sticky="w", **pad)
+        ).grid(row=r+4, column=1, sticky="w", **pad)
 
         self._status_var = tk.StringVar(value="Stopped")
         ttk.Label(frame, textvariable=self._status_var, foreground="gray").grid(
