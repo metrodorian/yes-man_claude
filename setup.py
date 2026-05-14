@@ -4,7 +4,7 @@ APP = ['key_repeater.py']
 DATA_FILES = []
 OPTIONS = {
     'argv_emulation': False,
-    'iconfile': 'Key Repeater.app/Contents/Resources/AppIcon.icns',
+    'iconfile': 'resources/AppIcon.icns',
     'plist': {
         'CFBundleName': 'Key Repeater',
         'CFBundleDisplayName': 'Key Repeater',
