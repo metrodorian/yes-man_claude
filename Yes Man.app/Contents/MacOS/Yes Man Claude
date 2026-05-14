@@ -1,15 +1,25 @@
 #!/bin/bash
 RES_DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
 
+# Probe candidate Pythons. Need:
+#   - tkinter (Apple's /usr/bin/python3 has it but ships 3.9 which is too old
+#     for the CoreGraphics calls used on macOS 14+)
+#   - Python >= 3.10 (3.10 is what miniconda ships, Homebrew is on 3.11+)
+PROBE='import sys, tkinter; sys.exit(0 if sys.version_info >= (3, 10) else 1)'
+
 for PY in \
+    /opt/homebrew/opt/python@3.13/bin/python3.13 \
+    /opt/homebrew/opt/python@3.12/bin/python3.12 \
+    /opt/homebrew/opt/python@3.11/bin/python3.11 \
     /opt/homebrew/bin/python3 \
     /usr/local/bin/python3 \
-    /usr/bin/python3 \
-    "$(command -v python3 2>/dev/null)"; do
-    if [ -x "$PY" ]; then
+    "$HOME/miniconda3/bin/python3" \
+    "$(command -v python3 2>/dev/null)" \
+    /usr/bin/python3; do
+    if [ -x "$PY" ] && "$PY" -c "$PROBE" 2>/dev/null; then
         exec "$PY" "$RES_DIR/yes_man_claude.py"
     fi
 done
 
-osascript -e 'display alert "Yes Man" message "Python 3 not found. Please install it from python.org or via Homebrew." as critical'
+osascript -e 'display alert "Yes Man" message "No suitable Python 3.10+ with tkinter found. Install Homebrew + Python: brew install python-tk@3.13" as critical'
 exit 1
