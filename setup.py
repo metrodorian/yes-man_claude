@@ -5,24 +5,18 @@ DATA_FILES = []
 OPTIONS = {
     'argv_emulation': False,
     'iconfile': 'resources/AppIcon.icns',
+    'arch': 'universal2',
     'plist': {
-        'CFBundleName': 'Yes Man Claude',
-        'CFBundleDisplayName': 'Yes Man Claude',
-        'CFBundleIdentifier': 'com.yoummday.yesmanclaude',
+        'CFBundleName': 'Yes Man',
+        'CFBundleDisplayName': 'Yes Man',
+        'CFBundleIdentifier': 'com.yoummday.yesman',
         'CFBundleVersion': '1.0',
         'CFBundleShortVersionString': '1.0',
         'NSHighResolutionCapable': True,
         'NSAppleEventsUsageDescription': 'Required to detect the frontmost application.',
-        'NSSpeechRecognitionUsageDescription': '',
         'NSAccessibilityUsageDescription': 'Required to send keyboard shortcuts to other applications.',
     },
-    'packages': ['pynput'],
     'includes': ['tkinter'],
-    'frameworks': [
-        '/Users/lennartduncker/miniconda3/lib/libffi.8.dylib',
-        '/Users/lennartduncker/miniconda3/lib/libtcl8.6.dylib',
-        '/Users/lennartduncker/miniconda3/lib/libtk8.6.dylib',
-    ],
 }
 
 setup(

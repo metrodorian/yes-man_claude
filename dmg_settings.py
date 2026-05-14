@@ -4,7 +4,7 @@ application = "Yes Man.app"
 appname = os.path.basename(application)
 
 format = "UDZO"
-size = "10M"
+size = "100M"
 
 files = [application]
 symlinks = {"Applications": "/Applications"}
