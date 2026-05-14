@@ -1,0 +1,16 @@
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "$0")/../../../" && pwd)"
+
+# Find python3 — covers arm64 (Homebrew /opt/homebrew) and x86 (/usr/local), plus system Python
+for PY in \
+    /opt/homebrew/bin/python3 \
+    /usr/local/bin/python3 \
+    /usr/bin/python3 \
+    "$(command -v python3 2>/dev/null)"; do
+    if [ -x "$PY" ]; then
+        exec "$PY" "$SCRIPT_DIR/yes_man_claude.py"
+    fi
+done
+
+osascript -e 'display alert "Yes Man" message "Python 3 not found. Please install it from python.org or via Homebrew." as critical'
+exit 1
