@@ -19,8 +19,9 @@ _cg.CGEventSetFlags.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
 _cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
 _cf.CFRelease.argtypes = [ctypes.c_void_p]
 
-# kCGEventSourceStateHIDSystemState = 0 → synthetic events won't reset HIDIdleTime
-_EVENT_SOURCE = _cg.CGEventSourceCreate(0)
+# kCGEventSourceStatePrivate = -1 → events tagged as synthetic; state=1 (HID)
+# detection won't see them. Verified empirically on this macOS version.
+_EVENT_SOURCE = _cg.CGEventSourceCreate(-1)
 
 KEY_CODES = {
     'a': 0, 's': 1, 'd': 2, 'f': 3, 'h': 4, 'g': 5, 'z': 6, 'x': 7,
@@ -97,40 +98,83 @@ def request_accessibility_permission():
                         'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'])
 
 
-# --- Mouse position polling (CGGetLastMouseDelta is deprecated/broken) ---
-class _CGPoint(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+# --- User-input tracking via CGEventTap filtered by PID ---
+import os
+_OUR_PID = os.getpid()
+_last_user_activity: float = time.monotonic()
+
+# Function signatures
+_cg.CGEventTapCreate.restype = ctypes.c_void_p
+_cg.CGEventTapCreate.argtypes = [
+    ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint64,
+    ctypes.c_void_p, ctypes.c_void_p
+]
+_cg.CGEventGetIntegerValueField.restype = ctypes.c_int64
+_cg.CGEventGetIntegerValueField.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+_cg.CGEventTapEnable.argtypes = [ctypes.c_void_p, ctypes.c_bool]
+
+_cf.CFMachPortCreateRunLoopSource.restype = ctypes.c_void_p
+_cf.CFMachPortCreateRunLoopSource.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32]
+_cf.CFRunLoopAddSource.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+_cf.CFRunLoopGetCurrent.restype = ctypes.c_void_p
+_cf.CFRunLoopRun.restype = None
+
+_kCFRunLoopCommonModes = ctypes.c_void_p.in_dll(_cf, "kCFRunLoopCommonModes")
+
+# CGEventTapCallBack: CGEventRef (*)(proxy, type, event, refcon)
+_TAP_CALLBACK_TYPE = ctypes.CFUNCTYPE(
+    ctypes.c_void_p,            # return: CGEventRef
+    ctypes.c_void_p,            # proxy
+    ctypes.c_uint32,            # event type
+    ctypes.c_void_p,            # event
+    ctypes.c_void_p,            # refcon
+)
 
 
-_cg.CGEventCreate.restype = ctypes.c_void_p
-_cg.CGEventCreate.argtypes = [ctypes.c_void_p]
-_cg.CGEventGetLocation.restype = _CGPoint
-_cg.CGEventGetLocation.argtypes = [ctypes.c_void_p]
+def _tap_callback(proxy, event_type, event, refcon):
+    try:
+        # kCGEventSourceUnixProcessID = 41
+        pid = _cg.CGEventGetIntegerValueField(event, 41)
+        if pid != _OUR_PID:
+            global _last_user_activity
+            _last_user_activity = time.monotonic()
+    except Exception:
+        pass
+    return event
 
 
-def _mouse_position():
-    e = _cg.CGEventCreate(None)
-    p = _cg.CGEventGetLocation(e)
-    _cf.CFRelease(e)
-    return (p.x, p.y)
+_tap_callback_c = _TAP_CALLBACK_TYPE(_tap_callback)
 
 
-# --- Background poller (frontmost app + ioreg idle for keyboard detection) ---
+def _start_event_tap():
+    if not has_accessibility_permission():
+        return
+    # Mask: keyDown(10), keyUp(11), mouseMoved(5), leftMouseDown(1), leftMouseUp(2),
+    #       rightMouseDown(3), rightMouseDragged(6), leftMouseDragged(7), scrollWheel(22)
+    mask = ((1 << 10) | (1 << 11) | (1 << 5) | (1 << 1) | (1 << 2) |
+            (1 << 3) | (1 << 6) | (1 << 7) | (1 << 22))
+    # kCGHIDEventTap=0, kCGHeadInsertEventTap=0, kCGEventTapOptionListenOnly=1
+    tap = _cg.CGEventTapCreate(0, 0, 1, mask, _tap_callback_c, None)
+    if not tap:
+        return
+    source = _cf.CFMachPortCreateRunLoopSource(None, tap, 0)
+    if not source:
+        return
+    _cf.CFRunLoopAddSource(_cf.CFRunLoopGetCurrent(), source, _kCFRunLoopCommonModes)
+    _cg.CGEventTapEnable(tap, True)
+    _cf.CFRunLoopRun()
+
+
+threading.Thread(target=_start_event_tap, daemon=True).start()
+
+
+def get_hardware_idle_seconds() -> float:
+    return time.monotonic() - _last_user_activity
+
+
+# --- Background poller for frontmost app name ---
 _cache_lock = threading.Lock()
 _cached_app: str = ''
-_cached_ioreg_idle: float = 0.0
-# Shared last-user-activity timestamp, updated by poller and mouse checker
-_last_user_activity: float = time.monotonic()
-_last_sent: float = 0.0
-
-
-def _set_last_sent(t: float):
-    global _last_sent
-    _last_sent = t
-
-
-def get_user_idle_seconds() -> float:
-    return time.monotonic() - _last_user_activity
 
 
 def get_frontmost_app() -> str:
@@ -138,39 +182,9 @@ def get_frontmost_app() -> str:
         return _cached_app
 
 
-def _poll_mouse():
-    """High-frequency mouse-movement detection — our keystrokes don't move the mouse."""
-    global _last_user_activity
-    last_pos = _mouse_position()
+def _poll_frontmost_app():
+    global _cached_app
     while True:
-        pos = _mouse_position()
-        if pos != last_pos:
-            _last_user_activity = time.monotonic()
-            last_pos = pos
-        time.sleep(0.05)
-
-
-def _poll_system_state():
-    """Low-frequency: frontmost app + ioreg idle for keyboard-activity detection."""
-    global _cached_app, _cached_ioreg_idle, _last_user_activity
-    prev_ioreg = 0.0
-    while True:
-        try:
-            out = subprocess.check_output(
-                ['ioreg', '-c', 'IOHIDSystem'], stderr=subprocess.DEVNULL, timeout=2
-            ).decode()
-            m = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', out)
-            ioreg = int(m.group(1)) / 1e9 if m else 0.0
-        except Exception:
-            ioreg = prev_ioreg
-
-        # ioreg idle reset = keyboard or click activity
-        if ioreg < prev_ioreg - 0.3:
-            # Only count as user activity if outside our grace window
-            if time.monotonic() - _last_sent > 1.5:
-                _last_user_activity = time.monotonic()
-        prev_ioreg = ioreg
-
         try:
             app = subprocess.check_output(
                 ['osascript', '-e',
@@ -179,16 +193,17 @@ def _poll_system_state():
             ).decode().strip()
         except Exception:
             app = ''
-
         with _cache_lock:
             _cached_app = app
-            _cached_ioreg_idle = ioreg
-
         time.sleep(0.5)
 
 
-threading.Thread(target=_poll_mouse, daemon=True).start()
-threading.Thread(target=_poll_system_state, daemon=True).start()
+threading.Thread(target=_poll_frontmost_app, daemon=True).start()
+
+
+# Compatibility shim — loop calls this; no longer needed but kept harmless
+def _set_last_sent(_t: float):
+    pass
 
 
 # --- App ---
@@ -315,7 +330,7 @@ class YesManClaudeApp(tk.Tk):
                 time.sleep(0.1)
                 continue
 
-            idle = get_user_idle_seconds()
+            idle = get_hardware_idle_seconds()
 
             if idle >= idle_threshold:
                 frontmost = get_frontmost_app()
