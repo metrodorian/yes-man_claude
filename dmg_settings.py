@@ -1,6 +1,6 @@
 import os
 
-application = "Key Repeater.app"
+application = "Yes Man Claude.app"
 appname = os.path.basename(application)
 
 format = "UDZO"

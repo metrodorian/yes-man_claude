@@ -1,14 +1,14 @@
 from setuptools import setup
 
-APP = ['key_repeater.py']
+APP = ['yes_man_claude.py']
 DATA_FILES = []
 OPTIONS = {
     'argv_emulation': False,
     'iconfile': 'resources/AppIcon.icns',
     'plist': {
-        'CFBundleName': 'Key Repeater',
-        'CFBundleDisplayName': 'Key Repeater',
-        'CFBundleIdentifier': 'com.yoummday.keyrepeater',
+        'CFBundleName': 'Yes Man Claude',
+        'CFBundleDisplayName': 'Yes Man Claude',
+        'CFBundleIdentifier': 'com.yoummday.yesmanclaude',
         'CFBundleVersion': '1.0',
         'CFBundleShortVersionString': '1.0',
         'NSHighResolutionCapable': True,
