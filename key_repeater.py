@@ -13,6 +13,7 @@ keyboard = Controller()
 _appservices = ctypes.cdll.LoadLibrary(
     "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
 )
+_appservices.AXIsProcessTrusted.restype = ctypes.c_bool
 
 
 def get_frontmost_app() -> str:
@@ -114,37 +115,48 @@ class KeyRepeaterApp(tk.Tk):
         self.resizable(False, False)
         self._running = False
         self._thread = None
+        self._banner = None
         self._build_ui()
-        # Ask for accessibility on startup if missing
         if not has_accessibility_permission():
             self.after(500, self._prompt_accessibility)
+        self._poll_accessibility()
 
     def _prompt_accessibility(self):
         request_accessibility_permission()
 
+    def _poll_accessibility(self):
+        granted = has_accessibility_permission()
+        if granted and self._banner is not None:
+            self._banner.destroy()
+            self._banner = None
+        elif not granted and self._banner is None:
+            self._show_banner()
+        self.after(1000, self._poll_accessibility)
+
+    def _show_banner(self):
+        self._banner = tk.Frame(self._frame, bg="#fff3cd", pady=8, padx=10)
+        self._banner.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        tk.Label(
+            self._banner,
+            text="Accessibility permission missing — keystrokes will not be sent.",
+            bg="#fff3cd", fg="#856404", wraplength=280, justify="left"
+        ).pack(side="left", fill="x", expand=True)
+        ttk.Button(
+            self._banner, text="Grant Access",
+            command=request_accessibility_permission
+        ).pack(side="right", padx=(8, 0))
+
     def _build_ui(self):
         pad = {"padx": 12, "pady": 6}
 
-        frame = ttk.Frame(self, padding=16)
-        frame.grid(row=0, column=0, sticky="nsew")
+        self._frame = ttk.Frame(self, padding=16)
+        self._frame.grid(row=0, column=0, sticky="nsew")
+        frame = self._frame
 
         if not has_accessibility_permission():
-            banner = tk.Frame(frame, bg="#fff3cd", pady=8, padx=10)
-            banner.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
-            tk.Label(
-                banner,
-                text="Accessibility permission missing — keystrokes will not be sent.",
-                bg="#fff3cd", fg="#856404", wraplength=280, justify="left"
-            ).pack(side="left", fill="x", expand=True)
-            ttk.Button(
-                banner, text="Grant Access",
-                command=request_accessibility_permission
-            ).pack(side="right", padx=(8, 0))
-            row_offset = 1
-        else:
-            row_offset = 0
+            self._show_banner()
 
-        r = row_offset
+        r = 1
         ttk.Label(frame, text="Shortcut 1:").grid(row=r, column=0, sticky="w", **pad)
         self._shortcut1_var = tk.StringVar(value="cmd+shift+enter")
         ttk.Entry(frame, textvariable=self._shortcut1_var, width=22).grid(row=r, column=1, sticky="ew", **pad)
