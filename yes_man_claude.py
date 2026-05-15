@@ -100,125 +100,56 @@ def request_accessibility_permission():
                         'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'])
 
 
-# --- Input Monitoring (required for CGEventTap to receive HID events) ---
-_iokit = ctypes.cdll.LoadLibrary(
-    '/System/Library/Frameworks/IOKit.framework/IOKit'
-)
-try:
-    _iokit.IOHIDCheckAccess.restype = ctypes.c_uint32
-    _iokit.IOHIDCheckAccess.argtypes = [ctypes.c_uint32]
-    _iokit.IOHIDRequestAccess.restype = ctypes.c_bool
-    _iokit.IOHIDRequestAccess.argtypes = [ctypes.c_uint32]
-    _HAS_HID_ACCESS_API = True
-except AttributeError:
-    _HAS_HID_ACCESS_API = False
+# --- User-input idle detection ---
+# CGEventSourceSecondsSinceLastEventType returns system-wide idle time
+# without needing Input Monitoring permission. Our own sends use the
+# private event source (state=-1), but they still increment the
+# HIDSystemState counter, so we apply a grace window: if the last
+# detected input is within ~0.3s of our last send, attribute it to us.
+_cg.CGEventSourceSecondsSinceLastEventType.restype = ctypes.c_double
+_cg.CGEventSourceSecondsSinceLastEventType.argtypes = [ctypes.c_int32, ctypes.c_uint32]
 
-# kIOHIDRequestTypeListenEvent = 1, kIOHIDAccessTypeGranted = 0
-_KIO_LISTEN = 1
+# kCGEventSourceStateHIDSystemState = 1, kCGAnyInputEventType = ~0
+_HID_STATE = 1
+_ANY_INPUT = 0xFFFFFFFF
+_OWN_SEND_GRACE = 0.3
 
-
-def has_input_monitoring_permission() -> bool:
-    if not _HAS_HID_ACCESS_API:
-        return True  # pre-10.15: no separate permission existed
-    try:
-        return _iokit.IOHIDCheckAccess(_KIO_LISTEN) == 0
-    except Exception:
-        return True
+_activity_lock = threading.Lock()
+_last_real_activity: float = time.monotonic()
+_last_send_time: float = 0.0
 
 
-def request_input_monitoring_permission():
-    if _HAS_HID_ACCESS_API:
+def _set_last_sent(t: float):
+    global _last_send_time
+    _last_send_time = t
+
+
+def _poll_user_activity():
+    global _last_real_activity
+    while True:
         try:
-            _iokit.IOHIDRequestAccess(_KIO_LISTEN)
-            return
+            raw_idle = _cg.CGEventSourceSecondsSinceLastEventType(_HID_STATE, _ANY_INPUT)
+            if raw_idle < 0:
+                raw_idle = 0.0
+            now = time.monotonic()
+            last_input_at = now - raw_idle
+            # If the most recent input was within the grace window of our
+            # last send, treat it as ours and ignore.
+            if abs(last_input_at - _last_send_time) > _OWN_SEND_GRACE:
+                with _activity_lock:
+                    if last_input_at > _last_real_activity:
+                        _last_real_activity = last_input_at
         except Exception:
             pass
-    subprocess.run(['open',
-                    'x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent'])
+        time.sleep(0.1)
 
 
-# --- User-input tracking via CGEventTap filtered by PID ---
-_OUR_PID = os.getpid()
-_last_user_activity: float = time.monotonic()
-
-# Function signatures
-_cg.CGEventTapCreate.restype = ctypes.c_void_p
-_cg.CGEventTapCreate.argtypes = [
-    ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint64,
-    ctypes.c_void_p, ctypes.c_void_p
-]
-_cg.CGEventGetIntegerValueField.restype = ctypes.c_int64
-_cg.CGEventGetIntegerValueField.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-_cg.CGEventTapEnable.argtypes = [ctypes.c_void_p, ctypes.c_bool]
-
-_cf.CFMachPortCreateRunLoopSource.restype = ctypes.c_void_p
-_cf.CFMachPortCreateRunLoopSource.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32]
-_cf.CFRunLoopAddSource.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
-_cf.CFRunLoopGetCurrent.restype = ctypes.c_void_p
-_cf.CFRunLoopRun.restype = None
-
-_kCFRunLoopCommonModes = ctypes.c_void_p.in_dll(_cf, "kCFRunLoopCommonModes")
-
-# CGEventTapCallBack: CGEventRef (*)(proxy, type, event, refcon)
-_TAP_CALLBACK_TYPE = ctypes.CFUNCTYPE(
-    ctypes.c_void_p,            # return: CGEventRef
-    ctypes.c_void_p,            # proxy
-    ctypes.c_uint32,            # event type
-    ctypes.c_void_p,            # event
-    ctypes.c_void_p,            # refcon
-)
-
-
-def _tap_callback(proxy, event_type, event, refcon):
-    try:
-        # kCGEventSourceUnixProcessID = 41
-        pid = _cg.CGEventGetIntegerValueField(event, 41)
-        if pid != _OUR_PID:
-            global _last_user_activity
-            _last_user_activity = time.monotonic()
-    except Exception:
-        pass
-    return event
-
-
-_tap_callback_c = _TAP_CALLBACK_TYPE(_tap_callback)
-
-
-_tap_alive = False
-
-
-def is_event_tap_alive() -> bool:
-    return _tap_alive
-
-
-def _start_event_tap():
-    global _tap_alive
-    # Mask: keyDown(10), keyUp(11), mouseMoved(5), leftMouseDown(1), leftMouseUp(2),
-    #       rightMouseDown(3), rightMouseDragged(6), leftMouseDragged(7), scrollWheel(22)
-    mask = ((1 << 10) | (1 << 11) | (1 << 5) | (1 << 1) | (1 << 2) |
-            (1 << 3) | (1 << 6) | (1 << 7) | (1 << 22))
-    while True:
-        if (has_accessibility_permission() and
-                has_input_monitoring_permission() and
-                not _tap_alive):
-            # kCGHIDEventTap=0, kCGHeadInsertEventTap=0, kCGEventTapOptionListenOnly=1
-            tap = _cg.CGEventTapCreate(0, 0, 1, mask, _tap_callback_c, None)
-            if tap:
-                source = _cf.CFMachPortCreateRunLoopSource(None, tap, 0)
-                if source:
-                    _cf.CFRunLoopAddSource(_cf.CFRunLoopGetCurrent(), source, _kCFRunLoopCommonModes)
-                    _cg.CGEventTapEnable(tap, True)
-                    _tap_alive = True
-                    _cf.CFRunLoopRun()  # blocks while tap is live
-                    _tap_alive = False
-        time.sleep(2)
-
-
-threading.Thread(target=_start_event_tap, daemon=True).start()
+threading.Thread(target=_poll_user_activity, daemon=True).start()
 
 
 def get_hardware_idle_seconds() -> float:
-    return time.monotonic() - _last_user_activity
+    with _activity_lock:
+        return time.monotonic() - _last_real_activity
 
 
 # --- Background poller for frontmost app name ---
@@ -250,11 +181,6 @@ def _poll_frontmost_app():
 threading.Thread(target=_poll_frontmost_app, daemon=True).start()
 
 
-# Compatibility shim — loop calls this; no longer needed but kept harmless
-def _set_last_sent(_t: float):
-    pass
-
-
 def _bundle_app_path():
     """Return the .app bundle path, or None when running outside a bundle."""
     res = os.environ.get('RESOURCEPATH')
@@ -283,59 +209,35 @@ class YesManClaudeApp(tk.Tk):
         self._build_ui()
         if not has_accessibility_permission():
             self.after(500, request_accessibility_permission)
-        if not has_input_monitoring_permission():
-            self.after(1500, request_input_monitoring_permission)
         self._poll_permissions()
 
-    def _missing_permissions(self):
-        missing = []
-        if not has_accessibility_permission():
-            missing.append('accessibility')
-        if not has_input_monitoring_permission():
-            missing.append('input_monitoring')
-        return missing
-
     def _poll_permissions(self):
-        missing = self._missing_permissions()
-        if missing != self._banner_state:
-            if self._banner is not None:
-                self._banner.destroy()
-                self._banner = None
-            if missing:
-                self._show_banner(missing)
-            self._banner_state = missing
+        granted = has_accessibility_permission()
+        if granted and self._banner is not None:
+            self._banner.destroy()
+            self._banner = None
+            self._banner_state = None
+        elif not granted and self._banner is None:
+            self._show_banner()
+            self._banner_state = 'missing'
         self.after(1000, self._poll_permissions)
 
-    def _show_banner(self, missing):
+    def _show_banner(self):
         self._banner = tk.Frame(self._frame, bg='#fff3cd', pady=8, padx=10)
         self._banner.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(0, 10))
 
-        if 'accessibility' in missing and 'input_monitoring' in missing:
-            msg = ('Grant Accessibility & Input Monitoring, then click '
-                   'Restart so macOS recognises the new permissions.')
-        elif 'accessibility' in missing:
-            msg = ('Accessibility permission missing — grant it, then click '
-                   'Restart. Keystrokes will not be sent otherwise.')
-        else:
-            msg = ('Input Monitoring permission missing — grant it, then '
-                   'click Restart. User activity will not be detected '
-                   'otherwise.')
-
         tk.Label(
-            self._banner, text=msg,
+            self._banner,
+            text=('Accessibility permission missing — grant it, then click '
+                  'Restart so macOS recognises the new permission.'),
             bg='#fff3cd', fg='#856404', wraplength=200, justify='left'
         ).pack(side='left', fill='x', expand=True)
 
         btns = tk.Frame(self._banner, bg='#fff3cd')
         btns.pack(side='right')
-        if 'accessibility' in missing:
-            ttk.Button(btns, text='Grant Accessibility',
-                       command=request_accessibility_permission
-                       ).pack(fill='x')
-        if 'input_monitoring' in missing:
-            ttk.Button(btns, text='Grant Input Monitoring',
-                       command=request_input_monitoring_permission
-                       ).pack(fill='x', pady=(2, 0))
+        ttk.Button(btns, text='Grant Accessibility',
+                   command=request_accessibility_permission
+                   ).pack(fill='x')
         ttk.Button(btns, text='Restart',
                    command=self._restart_app
                    ).pack(fill='x', pady=(6, 0))
@@ -353,10 +255,9 @@ class YesManClaudeApp(tk.Tk):
         self._frame.grid(row=0, column=0, sticky='nsew')
         frame = self._frame
 
-        missing = self._missing_permissions()
-        if missing:
-            self._show_banner(missing)
-            self._banner_state = missing
+        if not has_accessibility_permission():
+            self._show_banner()
+            self._banner_state = 'missing'
 
         r = 1
         ttk.Label(frame, text='Shortcut 1:').grid(row=r, column=0, sticky='w', **pad)
